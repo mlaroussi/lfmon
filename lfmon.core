@@ -1,0 +1,125 @@
+#!/bin/bash
+#
+# This is the main LFMON service core deamon.  It contains the
+# firewall instructions and algorithms.
+# See <URL:https://mlaroussi.github.io/lfmon/> for detailed information.
+#
+
+. ./lfmon.conf
+
+PIDFILE='/var/run/firewall.pid'
+
+log(){ echo -e "$(date) : $1" >> $LOGFILE ; }
+
+flush_rules(){
+$fw -P INPUT ACCEPT ; $fw -P FORWARD ACCEPT ; $fw -P OUTPUT ACCEPT ; $fw -X ; $fw -F
+}
+
+set_rules(){
+# Denying Loopback addresses spoofing.
+$fw -A INPUT -s 127.0.0.0/8 ! -i lo -j DROP
+
+# Denying traffic to broadcast, multicast or anycast address.
+$fw -A INPUT -m addrtype --dst-type BROADCAST -j DROP
+$fw -A INPUT -m addrtype --dst-type MULTICAST -j DROP
+$fw -A INPUT -m addrtype --dst-type ANYCAST -j DROP
+$fw -A INPUT -d 224.0.0.0/4 -j DROP
+
+## START :: SSH brute-force attacks countermeasure.
+$fw -N SSHBRUTE
+$fw -A SSHBRUTE -m recent --name SSH --set
+$fw -A SSHBRUTE -m recent --name SSH --update --seconds 300 --hitcount 10 -m limit --limit 1/second --limit-burst 100 -j LOG --log-prefix "iptables[SSH-brute]: "
+$fw -A SSHBRUTE -m recent --name SSH --update --seconds 300 --hitcount 10 -j DROP
+$fw -A SSHBRUTE -j ACCEPT
+## END ::  SSH brute-force attacks countermeasure.
+
+## START :: Ping flooding prevention
+$fw -N ICMPFLOOD
+$fw -A ICMPFLOOD -m recent --set --name ICMP --rsource
+$fw -A ICMPFLOOD -m recent --update --seconds 1 --hitcount 6 --name ICMP --rsource --rttl -m limit --limit 1/sec --limit-burst 1 -j LOG --log-prefix "LFMon[ICMP-flood]: "
+$fw -A ICMPFLOOD -m recent --update --seconds 1 --hitcount 6 --name ICMP --rsource --rttl -j DROP
+$fw -A ICMPFLOOD -j ACCEPT
+## END :: Ping flooding prevention
+
+## START :: PortScanning detection
+$fw -N portscan_check
+$fw -A portscan_check -m recent --name portscan --rcheck --seconds 86400 -j REJECT --reject-with icmp-host-prohibited
+$fw -A portscan_check -m recent --name portscan --remove
+$fw -A INPUT -j portscan_check
+## END :: PortScanning detection
+
+## START :: DDoS Counter-measures
+$fw -N ddos_prevent
+# Dropping non-conforming packets, such as malformed headers, etc.
+$fw -A ddos_prevent -m conntrack --ctstate INVALID -j DROP
+# The most known invalid TCP flags combinaison used in DDoS
+$fw -A ddos_prevent -p tcp --tcp-flags SYN,ACK SYN,ACK -m state --state NEW -j DROP
+$fw -A ddos_prevent -p tcp --tcp-flags ALL NONE -j DROP
+$fw -A ddos_prevent -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP
+$fw -A ddos_prevent -p tcp --tcp-flags SYN,RST SYN,RST -j DROP
+$fw -A ddos_prevent -p tcp --tcp-flags ALL SYN,RST,ACK,FIN,URG -j DROP
+$fw -A ddos_prevent -p tcp --tcp-flags FIN,RST FIN,RST -j DROP
+$fw -A ddos_prevent -p tcp --tcp-flags ACK,FIN FIN -j DROP
+$fw -A ddos_prevent -p tcp --tcp-flags ACK,PSH PSH -j DROP
+$fw -A ddos_prevent -p tcp --tcp-flags ACK,URG URG -j DROP
+$fw -A INPUT -j ddos_prevent
+## END :: DDoS Counter-measures
+
+## START :: Defining services
+$fw -N allowed_services
+
+# Allowing loopback traffic .
+$fw -A allowed_services -i lo -j ACCEPT
+
+# Allowing connections having established or related as state.
+$fw -A allowed_services -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+# Allowing $ADMIN_IPs to connect to the ssh port straight away
+for IP in $ADMIN_IP; do $fw -A allowed_services -p tcp --dport $SSH_PORT -s $IP -j ACCEPT; done
+
+# Preventing SSH Brute force attack from public IP addresses
+$fw -A allowed_services -p tcp --dport $SSH_PORT --syn -m conntrack --ctstate NEW -j SSHBRUTE
+
+# Allowing normal services to run and work correctly
+for port in $PORTS_TCP; do $fw -A allowed_services -p tcp --dport $port --syn -m conntrack --ctstate NEW -j ACCEPT; done
+for port in $PORTS_UDP; do $fw -A allowed_services -p tcp --dport $port --syn -m conntrack --ctstate NEW -j ACCEPT; done
+
+$fw -A INPUT -j allowed_services
+
+## END :: Defining services
+
+# PortScanning counter-measure
+$fw -N portscan_actions
+$fw -A portscan_actions -p tcp -m tcp -m multiport --dports $psd_ports -m recent --name portscan --set -j LOG --log-prefix "LFMon[Portscan]: "
+$fw -A portscan_actions -p tcp -m tcp -m multiport --dports $psd_ports -m recent --name portscan --set -j DROP
+$fw -A INPUT -j portscan_actions
+
+# Dennying everything else
+$fw -A INPUT -p tcp -j REJECT --reject-with icmp-host-prohibited
+$fw -A FORWARD -p tcp -j REJECT --reject-with icmp-host-prohibited
+
+log "Rules have been re-configured"
+}
+
+reset_rules(){ flush_rules ; set_rules ; }
+
+check(){
+        nb_input_rules=$($fw -nL INPUT | egrep -v 'prot opt|Chain' | wc -l)
+        case "$nb_input_rules" in
+        0)  log "Looks like it's been flushed"
+                reset_rules
+                ;;
+        7)  log "Working good"
+                ;;
+        *)      log "Abnormal rules found"
+                reset_rules
+                ;;
+        esac
+}
+
+monitor(){
+        trap -- '' SIGINT SIGTERM
+        rttm=$(($(date -d "$(date +00:00-24:00)" +%s)-$(date +%s)))
+        sleep $rttm
+        while true ; do [[ $(date +%M| grep '00') ]] && (check ; sleep 21595) ; done
+}
